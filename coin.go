@@ -1,20 +1,17 @@
 package main
 
 import (
-	//"fmt"
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"errors"
+	"io"
+	"log"
+	"math/rand"
 	"net"
 	"net/http"
-	"math/rand"
-	"crypto/sha256"
-	"io/ioutil"
 	"time"
-	"log"
-	"errors"
 )
-
-
 
 var httpClient *http.Client
 
@@ -24,11 +21,10 @@ type Peer struct {
 
 var peers []Peer
 
-
 type Header struct {
 	StartString [4]byte  // Magic bytes indicating the originating network; used to seek to next message when stream state is unknown.
 	CommandName [12]byte // ASCII string which identifies payload message type. Followed by nulls (0x00) to pad out byte count; for example: version\0\0\0\0\0
-	PayloadSize uint32  // Number of bytes in payload.
+	PayloadSize uint32   // Number of bytes in payload.
 	Checksum    [4]byte  // First 4 bytes of SHA256(SHA256(payload)). Default is 0x5df6e0e2 (SHA256(SHA256(<empty string>)))
 }
 
@@ -43,21 +39,86 @@ func (h *Header) encode() []byte {
 	return b.Bytes()
 }
 
-
 type VersionPayload struct {
-	Version          int32
-	Services         uint64
-	Timestamp        int64
-	AddrRecvIP       uint64 // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
-	AddrRecvPort     uint16 // big-endian byte order
-	AddrRecvServices uint64 // Should be identical to `services` field above
-	AddrTransIP      uint64 // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
-	AddrTransPort    uint16 // big-endian byte order
-	Nonce            uint64
-	UserAgentBytes   uint
-	UserAgent        string
-	StartHeight      int32
-	Relay            bool
+	Version           int32
+	Services          uint64
+	Timestamp         int64
+	AddrRecvIP        []byte // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
+	AddrRecvPort      uint16 // big-endian byte order
+	AddrRecvServices  uint64 // Should be identical to `services` field above
+	AddrTransIP       []byte // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
+	AddrTransPort     uint16 // big-endian byte order
+	AddrTransServices uint64 // Should be identical to `services` field above
+	Nonce             uint64
+	UserAgentBytes    uint8
+	UserAgent         string
+	StartHeight       int32
+	Relay             bool
+}
+
+func decode(buf []byte) (VersionPayload, error) {
+	var err error
+	var v VersionPayload
+
+	b := bytes.NewReader(buf)
+
+	err = binary.Read(b, binary.LittleEndian, v.Version)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.LittleEndian, v.Timestamp)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.BigEndian, v.AddrRecvIP)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.BigEndian, v.AddrRecvPort)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.LittleEndian, v.AddrRecvServices)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.LittleEndian, v.AddrTransServices)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.BigEndian, v.AddrTransIP)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.BigEndian, v.AddrTransPort)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.LittleEndian, v.Nonce)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.LittleEndian, v.UserAgentBytes)
+	if err != nil {
+		return v, err
+	}
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.LittleEndian, v.UserAgent)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.LittleEndian, v.StartHeight)
+	if err != nil {
+		return v, err
+	}
+	err = binary.Read(b, binary.LittleEndian, v.Relay)
+	if err != nil {
+		return v, err
+	}
+
+	return v, err
 }
 
 func (v *VersionPayload) encode() []byte {
@@ -66,14 +127,15 @@ func (v *VersionPayload) encode() []byte {
 	binary.Write(b, binary.LittleEndian, v.Version)
 	binary.Write(b, binary.LittleEndian, v.Services)
 	binary.Write(b, binary.LittleEndian, v.Timestamp)
+	binary.Write(b, binary.LittleEndian, v.AddrRecvServices)
 	binary.Write(b, binary.BigEndian, v.AddrRecvIP)
 	binary.Write(b, binary.BigEndian, v.AddrRecvPort)
-	binary.Write(b, binary.LittleEndian, v.AddrRecvServices)
+	binary.Write(b, binary.LittleEndian, v.AddrTransServices)
 	binary.Write(b, binary.BigEndian, v.AddrTransIP)
 	binary.Write(b, binary.BigEndian, v.AddrTransPort)
 	binary.Write(b, binary.LittleEndian, v.Nonce)
 	binary.Write(b, binary.LittleEndian, v.UserAgentBytes)
-	binary.Write(b, binary.LittleEndian, v.UserAgent)
+	_, _ = b.WriteString(v.UserAgent)
 	binary.Write(b, binary.LittleEndian, v.StartHeight)
 	binary.Write(b, binary.LittleEndian, v.Relay)
 
@@ -110,46 +172,68 @@ cf050500 ........................... Start height: 329167
 01 ................................. Relay flag: true
 */
 
-func handleCoinMessage(w http.ResponseWriter, req *http.Request){
-	
-	bodyBytes, err := ioutil.ReadAll(req.Body)
-	if err != nil {
-		log.Fatal("Failed to read body bytes")
-	}
+func readBytes(conn net.Conn) []byte {
+	conn.SetReadDeadline(time.Now().Add(time.Second * 5))
+	buf := make([]byte, 0, 4096) // big buffer
+	tmp := make([]byte, 256)     // using small tmo buffer for demonstrating
+	for {
+		n, err := conn.Read(tmp)
+		if err != nil {
+			if err != io.EOF {
+				log.Println("read error:", err)
+			}
+			break
+		}
+		//fmt.Println("got", n, "bytes.")
+		buf = append(buf, tmp[:n]...)
 
-	log.Printf("Received request with body: %x", bodyBytes)
+	}
+	log.Println("total size:", len(buf))
+	return buf
+}
+
+func handleCoinMessage(conn net.Conn) {
+
+	buf := readBytes(conn)
+
+	log.Printf("Received request with bytes: %x (%s)", buf, string(buf))
+
+	conn.Write([]byte("Message Received"))
+	conn.Close()
 
 }
 
 func init() {
 
 	tr := &http.Transport{
-		IdleConnTimeout:    10 * time.Second,
+		IdleConnTimeout: 10 * time.Second,
 	}
 	httpClient = &http.Client{
 		Transport: tr,
-		Timeout: 3 * time.Second,
+		Timeout:   3 * time.Second,
 	}
 
-	
-
 }
-
 
 func main() {
 
 	var err error
 
-	http.HandleFunc("/", handleCoinMessage)
+	go func() {
 
-	server := &http.Server{
-		Addr: ":8332",
-		ReadTimeout: 10 * time.Second,
-		Handler: nil,
-	}
+		ln, err := net.Listen("tcp", ":8333")
+		if err != nil {
+			log.Print(err)
+		}
 
-	go server.ListenAndServe()
-
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				log.Print(err)
+			}
+			go handleCoinMessage(conn)
+		}
+	}()
 
 	// Query bitcoin core DNS root for peers
 	peers, err := discoverPeers()
@@ -159,17 +243,26 @@ func main() {
 
 	log.Printf("Got list of %d peers", len(peers))
 
-	for _,peer := range peers {
-		bodyBytes, err := sendVersionMessage(peer.IP)
+	goodPeers := []Peer{}
+
+	for _, peer := range peers {
+		err := sendVersionMessage(peer.IP)
 		if err != nil {
 			//log.Printf("Failed to sendVersionMessage: %s", err.Error())
 			log.Printf("Failed to sendVersionMessage to peer %s", peer.IP)
 			continue
 		}
 
-		log.Printf("Peer %s returned data: %x", peer.IP, bodyBytes)
+		goodPeers = append(goodPeers, peer)
+
+		log.Printf("Connecte to peer %s successfully", peer.IP)
+
+		//if len(goodPeers) > 15 {
+		//	goto PEERSCONNECTED
+		//}
 	}
-	
+
+	//PEERSCONNECTED:
 
 	// Connect to a peer using `version` message using sendVersionMessage()
 
@@ -189,16 +282,14 @@ func main() {
 
 }
 
-func ipv4mappedipv6(addr string) (uint64, error) {
-
+func ipv4mappedipv6(addr string) ([]byte, error) {
 
 	peerIP := net.ParseIP(addr)
 	if peerIP == nil {
-		return uint64(0), errors.New("Failed to parse IP of peer")
+		return []byte{}, errors.New("Failed to parse IP of peer")
 	}
-	
 
-	//log.Printf("IP pre mod mapped: %v", peerIP[9])	
+	//log.Printf("IP pre mod mapped: %v", peerIP[9])
 
 	//peerIP = peerIP.To16()
 
@@ -207,14 +298,12 @@ func ipv4mappedipv6(addr string) (uint64, error) {
 
 	//log.Printf("IP mapped: %v", peerIP[9])
 
-	buf := bytes.NewBuffer(peerIP[:])
-
 	//log.Printf("IP mapped: %v", buf.Bytes())
 
-	return binary.ReadUvarint(buf)
+	return []byte(peerIP), nil
 }
 
-func sendVersionMessage(peer string) ([]byte, error) {
+func sendVersionMessage(peer string) error {
 	// version number
 	// block
 	// current time
@@ -223,7 +312,7 @@ func sendVersionMessage(peer string) ([]byte, error) {
 
 	nonce := rand.Uint64()
 
-	userAgent := "Satoshi:0.9.3"
+	userAgent := "/Satoshi:0.9.3/"
 	userAgentBytes := len(userAgent)
 
 	peerMappedIP, err := ipv4mappedipv6(peer)
@@ -231,29 +320,32 @@ func sendVersionMessage(peer string) ([]byte, error) {
 		log.Print("Failed to return peerMappedIP: ", err)
 	}
 
-
 	localMappedIP, err := ipv4mappedipv6("63.226.144.254")
 	if err != nil {
 		log.Print("Failed to return localMappedIP: ", err)
 	}
 
 	v := VersionPayload{
-			Version: 70015,
-			Services: 0,
-			Timestamp: time.Now().Unix(),
-			AddrRecvIP: peerMappedIP, // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
-			AddrRecvPort: 8332, // big-endian byte order
-			AddrRecvServices: 0, // Should be identical to `services` field above
-			AddrTransIP: localMappedIP, // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
-			AddrTransPort: 8332, // big-endian byte order
-			Nonce: nonce,
-			UserAgentBytes: uint(userAgentBytes),
-			UserAgent: userAgent,
-			StartHeight: 0,
-			Relay: false,
+		Version:          70015,
+		Services:         0,
+		Timestamp:        time.Now().Unix(),
+		AddrRecvIP:       peerMappedIP,  // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
+		AddrRecvPort:     8333,          // big-endian byte order
+		AddrRecvServices: 0,             // Should be identical to `services` field above
+		AddrTransIP:      localMappedIP, // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
+		AddrTransPort:    8333,          // big-endian byte order
+		Nonce:            nonce,
+		UserAgentBytes:   uint8(userAgentBytes),
+		UserAgent:        userAgent,
+		StartHeight:      0,
+		Relay:            false,
 	}
 
+	//log.Printf("VersionPayload: %#v", v)
+
 	bodyBytes := v.encode()
+
+	//log.Printf("Body: %v", bodyBytes)
 
 	bodySum := sha256.Sum256(bodyBytes)
 
@@ -261,40 +353,46 @@ func sendVersionMessage(peer string) ([]byte, error) {
 	copy(arr[:], bodySum[:4])
 
 	h := Header{
-		StartString: [4]byte{0xf9,0xbe,0xb4,0xd9},
-		CommandName: [12]byte{0x76,0x65,0x72,0x73,0x69,0x6f,0x5e,0x00,0x00,0x00,0x00,0x00},
+		StartString: [4]byte{0xf9, 0xbe, 0xb4, 0xd9},
+		CommandName: [12]byte{0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x5e, 0x00, 0x00, 0x00, 0x00, 0x00},
 		PayloadSize: uint32(len(bodyBytes)),
-		Checksum: arr,
+		Checksum:    arr,
 	}
+
+	//log.Printf("Header: %#v", h)
 
 	headerBytes := h.encode()
 
 	reqBuf := bytes.NewBuffer(headerBytes)
-	_,err = reqBuf.Write(bodyBytes)
+	_, err = reqBuf.Write(bodyBytes)
 	if err != nil {
 		log.Fatalf("Failed to write body to version message. %s", err.Error())
 	}
 
-	req, err := http.NewRequest("POST", "http://" + peer + ":8332", reqBuf)
+	conn, err := net.DialTimeout("tcp", peer+":8333", time.Second*3)
 	if err != nil {
-		log.Fatalf("Failed to create version message. %s", err.Error())
+		log.Print("Failed to create version message. %s", err.Error())
+		return err
 	}
 
-	resp, err := httpClient.Do(req)
+	log.Printf("Writing %x to conn", reqBuf.Bytes())
+
+	conn.SetWriteDeadline(time.Now().Add(time.Second * 5))
+	_, err = conn.Write(reqBuf.Bytes())
 	if err != nil {
-		return []byte{}, err
+		log.Print(err)
 	}
+	conn.Close()
 
-	defer resp.Body.Close()
+	/*
+		respBytes := readBytes(conn)
+		if err != nil {
+			log.Print(err)
+		}
 
-	bodyBytes, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatalf("Failed to read version message response. %s", err.Error())
-	}
-
-	log.Printf("Peer %s responded with: %x", req.Host, bodyBytes)
-
-	return bodyBytes, nil
+		log.Printf("Peer responded with: %x", respBytes)
+	*/
+	return nil
 	// If version received in response, send verack with sendVersionAckMessage()
 }
 
@@ -310,10 +408,10 @@ func sendVersionAckMessage(peer string) {
 	// Send empty message. Just headers.
 
 	h := Header{
-		StartString: [4]byte{0xf9,0xbe,0xb4,0xd9},
-		CommandName: [12]byte{0x76,0x65,0x72,0x61,0x63,0x6b,0x00,0x00,0x00,0x00,0x00,0x00},
+		StartString: [4]byte{0xf9, 0xbe, 0xb4, 0xd9},
+		CommandName: [12]byte{0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		PayloadSize: 0,
-		Checksum: [4]byte{0x5d,0xf6,0xe0,0xe2},
+		Checksum:    [4]byte{0x5d, 0xf6, 0xe0, 0xe2},
 	}
 
 	bodyBytes := h.encode()
@@ -324,15 +422,20 @@ func sendVersionAckMessage(peer string) {
 
 func discoverPeers() ([]Peer, error) {
 	var peers []Peer
+	var err error
 
-	host := "seed.bitcoin.sipa.be"
-	hosts, err := net.LookupIP(host)
-	if err != nil {
-		return peers, err
-	}
+	var dnsSeeds = []string{"seed.bitcoin.sipa.be", "dnsseed.bluematt.me", "dnsseed.bitcoin.dashjr.org", "seed.bitcoinstats.com", "seed.bitcoin.jonasschnelli.ch", "seed.btc.petertodd.org"}
 
-	for _, v := range hosts {
-		peers = append(peers, Peer{IP: v.String()})
+	for _, seed := range dnsSeeds {
+		hosts, err := net.LookupIP(seed)
+		if err != nil {
+			return peers, err
+		}
+
+		for _, v := range hosts {
+			peers = append(peers, Peer{IP: v.String()})
+		}
+
 	}
 
 	return peers, err
