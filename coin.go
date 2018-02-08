@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"time"
+	"fmt"
 )
 
 var httpClient *http.Client
@@ -205,14 +206,6 @@ func handleCoinMessage(conn net.Conn) {
 
 func init() {
 
-	tr := &http.Transport{
-		IdleConnTimeout: 10 * time.Second,
-	}
-	httpClient = &http.Client{
-		Transport: tr,
-		Timeout:   3 * time.Second,
-	}
-
 }
 
 func main() {
@@ -257,9 +250,10 @@ func main() {
 
 		log.Printf("Connecte to peer %s successfully", peer.IP)
 
-		//if len(goodPeers) > 15 {
-		//	goto PEERSCONNECTED
-		//}
+		if len(goodPeers) > 5 {
+			break
+			//goto PEERSCONNECTED
+		}
 	}
 
 	//PEERSCONNECTED:
@@ -312,7 +306,7 @@ func sendVersionMessage(peer string) error {
 
 	nonce := rand.Uint64()
 
-	userAgent := "/Satoshi:0.9.3/"
+	userAgent := "/Satoshi:5.12/"
 	userAgentBytes := len(userAgent)
 
 	peerMappedIP, err := ipv4mappedipv6(peer)
@@ -320,7 +314,7 @@ func sendVersionMessage(peer string) error {
 		log.Print("Failed to return peerMappedIP: ", err)
 	}
 
-	localMappedIP, err := ipv4mappedipv6("63.226.144.254")
+	localMappedIP, err := ipv4mappedipv6("52.21.183.128")
 	if err != nil {
 		log.Print("Failed to return localMappedIP: ", err)
 	}
@@ -346,15 +340,15 @@ func sendVersionMessage(peer string) error {
 	bodyBytes := v.encode()
 
 	//log.Printf("Body: %v", bodyBytes)
-
-	bodySum := sha256.Sum256(bodyBytes)
+	bodySum1 := sha256.Sum256(bodyBytes)
+	bodySum2 := sha256.Sum256(bodySum1[:])
 
 	var arr [4]byte
-	copy(arr[:], bodySum[:4])
+	copy(arr[:], bodySum2[:4])
 
 	h := Header{
 		StartString: [4]byte{0xf9, 0xbe, 0xb4, 0xd9},
-		CommandName: [12]byte{0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x5e, 0x00, 0x00, 0x00, 0x00, 0x00},
+		CommandName: [12]byte{0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00},
 		PayloadSize: uint32(len(bodyBytes)),
 		Checksum:    arr,
 	}
@@ -368,10 +362,12 @@ func sendVersionMessage(peer string) error {
 	if err != nil {
 		log.Fatalf("Failed to write body to version message. %s", err.Error())
 	}
-
+	if len(peer) > 15 {
+		peer = fmt.Sprintf("%s%s%s","[",peer,"]")
+	}
 	conn, err := net.DialTimeout("tcp", peer+":8333", time.Second*3)
 	if err != nil {
-		log.Print("Failed to create version message. %s", err.Error())
+		log.Printf("Failed to send version message. %s", err.Error())
 		return err
 	}
 
@@ -382,18 +378,20 @@ func sendVersionMessage(peer string) error {
 	if err != nil {
 		log.Print(err)
 	}
-	conn.Close()
 
-	/*
+	
 		respBytes := readBytes(conn)
 		if err != nil {
 			log.Print(err)
 		}
 
 		log.Printf("Peer responded with: %x", respBytes)
-	*/
-	return nil
+	conn.Close()	
+	
 	// If version received in response, send verack with sendVersionAckMessage()
+
+	sendVersionAckMessage(peer)
+	return nil
 }
 
 /*

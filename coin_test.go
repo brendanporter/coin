@@ -68,7 +68,7 @@ func TestValidVersionPayload(t *testing.T) {
 
 }
 
-/*
+
 func TestPeerDiscovery(t *testing.T) {
 
 	peers, err := discoverPeers()
@@ -101,4 +101,4 @@ func TestPeerConnection(t *testing.T) {
 	}
 
 }
-*/
+
