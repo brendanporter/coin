@@ -5,19 +5,20 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
 	"time"
-	"fmt"
 )
 
 var httpClient *http.Client
 
 type Peer struct {
-	IP string
+	IP      string
+	Version VersionPayload
 }
 
 var peers []Peer
@@ -40,16 +41,102 @@ func (h *Header) encode() []byte {
 	return b.Bytes()
 }
 
+func decodeHeader(buf []byte) (Header, error) {
+	var err error
+	var h Header
+
+	b := bytes.NewReader(buf)
+
+	err = binary.Read(b, binary.LittleEndian, &h.StartString)
+	if err != nil {
+		return h, err
+	}
+	err = binary.Read(b, binary.LittleEndian, &h.CommandName)
+	if err != nil {
+		return h, err
+	}
+	err = binary.Read(b, binary.LittleEndian, &h.PayloadSize)
+	if err != nil {
+		return h, err
+	}
+	err = binary.Read(b, binary.LittleEndian, &h.Checksum)
+	if err != nil {
+		return h, err
+	}
+	return h, nil
+}
+
+type GetBlocksMessage struct {
+	Version           int32
+	HashCount         uint
+	BlockHeaderHashes [][32]byte
+	StopHash          [32]byte
+}
+
+func (g *GetBlocksMessage) encode() []byte {
+	b := bytes.Buffer{}
+
+	binary.Write(b, binary.LittleEndian, g.Version)
+	binary.Write(b, binary.LittleEndian, g.HashCount)
+
+	for _, hash := range g.BlockHeaderHashes {
+		binary.Write(b, binary.LittleEndian, hash)
+	}
+
+	binary.Write(b, binary.LittleEndian, g.StopHash)
+
+	return b.Bytes()
+}
+
+type Inventory struct {
+	DataType uint
+	Hash     [32]byte
+}
+
+type InvMessage struct {
+	Count uint
+	Inventory []Inventory
+}
+
+func decodeInvMessage(buf []byte) (InvMessage, error){
+	var err error
+	var inv InvMessage
+
+	b := bytes.NewReader(buf)
+
+	err = binary.Read(b, binary.LittleEndian, &inv.Count)
+	if err != nil {
+		return inv, err
+	}
+
+	for i := 0; i < inv.Count; i++ {
+		var inventory Inventory
+		err = binary.Read(b, binary.LittleEndian, &inventory.DataType)
+		if err != nil {
+			return inv, err
+		}
+
+		err = binary.Read(b, binary.LittleEndian, &inventory.Hash)
+		if err != nil {
+			return inv, err
+		}
+
+		inv.Inventory = append(inv.Inventory, inventory)
+	}
+
+	return inv, nil
+}
+
 type VersionPayload struct {
 	Version           int32
 	Services          uint64
 	Timestamp         int64
-	AddrRecvIP        []byte // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
-	AddrRecvPort      uint16 // big-endian byte order
-	AddrRecvServices  uint64 // Should be identical to `services` field above
-	AddrTransIP       []byte // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
-	AddrTransPort     uint16 // big-endian byte order
-	AddrTransServices uint64 // Should be identical to `services` field above
+	AddrRecvIP        [16]byte // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
+	AddrRecvPort      uint16   // big-endian byte order
+	AddrRecvServices  uint64   // Should be identical to `services` field above
+	AddrTransIP       [16]byte // IPv6 address, or IPv4-mapped-IPv6 ::ffff:127.0.0.1
+	AddrTransPort     uint16   // big-endian byte order
+	AddrTransServices uint64   // Should be identical to `services` field above
 	Nonce             uint64
 	UserAgentBytes    uint8
 	UserAgent         string
@@ -57,64 +144,74 @@ type VersionPayload struct {
 	Relay             bool
 }
 
-func decode(buf []byte) (VersionPayload, error) {
+func decodeVersionMessage(buf []byte) (VersionPayload, error) {
 	var err error
 	var v VersionPayload
 
 	b := bytes.NewReader(buf)
 
-	err = binary.Read(b, binary.LittleEndian, v.Version)
+	err = binary.Read(b, binary.LittleEndian, &v.Version)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.LittleEndian, v.Timestamp)
+	err = binary.Read(b, binary.LittleEndian, &v.Services)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.BigEndian, v.AddrRecvIP)
+	err = binary.Read(b, binary.LittleEndian, &v.Timestamp)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.BigEndian, v.AddrRecvPort)
+	err = binary.Read(b, binary.LittleEndian, &v.AddrRecvServices)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.LittleEndian, v.AddrRecvServices)
+	err = binary.Read(b, binary.BigEndian, &v.AddrRecvIP)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.LittleEndian, v.AddrTransServices)
+	err = binary.Read(b, binary.BigEndian, &v.AddrRecvPort)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.BigEndian, v.AddrTransIP)
+	err = binary.Read(b, binary.LittleEndian, &v.AddrTransServices)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.BigEndian, v.AddrTransPort)
+	err = binary.Read(b, binary.BigEndian, &v.AddrTransIP)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.LittleEndian, v.Nonce)
+	err = binary.Read(b, binary.BigEndian, &v.AddrTransPort)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.LittleEndian, v.UserAgentBytes)
+	err = binary.Read(b, binary.LittleEndian, &v.Nonce)
 	if err != nil {
 		return v, err
 	}
+	err = binary.Read(b, binary.LittleEndian, &v.UserAgentBytes)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.LittleEndian, v.UserAgent)
+
+	//log.Printf("User agent byte count: %d", v.UserAgentBytes)
+
+	uab := bytes.Buffer{}
+	for i := 0; i < int(v.UserAgentBytes); i++ {
+		c, err := b.ReadByte()
+		if err != nil {
+			log.Print(err)
+		}
+		uab.WriteByte(c)
+	}
+	v.UserAgent = uab.String()
+
+	err = binary.Read(b, binary.LittleEndian, &v.StartHeight)
 	if err != nil {
 		return v, err
 	}
-	err = binary.Read(b, binary.LittleEndian, v.StartHeight)
-	if err != nil {
-		return v, err
-	}
-	err = binary.Read(b, binary.LittleEndian, v.Relay)
+	err = binary.Read(b, binary.LittleEndian, &v.Relay)
 	if err != nil {
 		return v, err
 	}
@@ -189,7 +286,7 @@ func readBytes(conn net.Conn) []byte {
 		buf = append(buf, tmp[:n]...)
 
 	}
-	log.Println("total size:", len(buf))
+	//log.Println("total size:", len(buf))
 	return buf
 }
 
@@ -248,12 +345,24 @@ func main() {
 
 		goodPeers = append(goodPeers, peer)
 
-		log.Printf("Connecte to peer %s successfully", peer.IP)
+		log.Printf("Connected to peer %s successfully", peer.IP)
 
 		if len(goodPeers) > 5 {
 			break
 			//goto PEERSCONNECTED
 		}
+	}
+
+
+	for _,goodPeer := range goodPeers {
+
+
+		gbm := GetBlocksMessage{
+			Version: 70015,
+			HashCount: 0,
+			StopHash: [32]byte{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}
+		}
+
 	}
 
 	//PEERSCONNECTED:
@@ -276,11 +385,11 @@ func main() {
 
 }
 
-func ipv4mappedipv6(addr string) ([]byte, error) {
+func ipv4mappedipv6(addr string) ([16]byte, error) {
 
 	peerIP := net.ParseIP(addr)
 	if peerIP == nil {
-		return []byte{}, errors.New("Failed to parse IP of peer")
+		return [16]byte{}, errors.New("Failed to parse IP of peer")
 	}
 
 	//log.Printf("IP pre mod mapped: %v", peerIP[9])
@@ -293,8 +402,9 @@ func ipv4mappedipv6(addr string) ([]byte, error) {
 	//log.Printf("IP mapped: %v", peerIP[9])
 
 	//log.Printf("IP mapped: %v", buf.Bytes())
-
-	return []byte(peerIP), nil
+	var b [16]byte
+	copy(b[:], peerIP)
+	return b, nil
 }
 
 func sendVersionMessage(peer string) error {
@@ -363,7 +473,7 @@ func sendVersionMessage(peer string) error {
 		log.Fatalf("Failed to write body to version message. %s", err.Error())
 	}
 	if len(peer) > 15 {
-		peer = fmt.Sprintf("%s%s%s","[",peer,"]")
+		peer = fmt.Sprintf("%s%s%s", "[", peer, "]")
 	}
 	conn, err := net.DialTimeout("tcp", peer+":8333", time.Second*3)
 	if err != nil {
@@ -379,15 +489,32 @@ func sendVersionMessage(peer string) error {
 		log.Print(err)
 	}
 
-	
-		respBytes := readBytes(conn)
-		if err != nil {
-			log.Print(err)
-		}
+	respBytes := readBytes(conn)
+	if err != nil {
+		log.Print(err)
+	}
 
-		log.Printf("Peer responded with: %x", respBytes)
-	conn.Close()	
-	
+	//log.Printf("Peer responded with: %x", respBytes)
+
+	header, err := decodeHeader(respBytes)
+
+	//log.Printf("Peer header: %#v", header)
+
+	peerVersion, err := decodeVersionMessage(respBytes[24:])
+	if err != nil {
+		log.Print(err)
+	}
+
+	for _, p := range peers {
+		if p.IP == peer {
+			p.Version = peerVersion
+		}
+	}
+
+	log.Printf("Peer version: %#v", peerVersion)
+
+	conn.Close()
+
 	// If version received in response, send verack with sendVersionAckMessage()
 
 	sendVersionAckMessage(peer)
@@ -402,7 +529,7 @@ f9beb4d9 ................... Start string: Mainnet
 5df6e0e2 ................... Checksum: SHA256(SHA256(<empty>))
 */
 
-func sendVersionAckMessage(peer string) {
+func sendVersionAckMessage(peer string) error {
 	// Send empty message. Just headers.
 
 	h := Header{
@@ -412,10 +539,31 @@ func sendVersionAckMessage(peer string) {
 		Checksum:    [4]byte{0x5d, 0xf6, 0xe0, 0xe2},
 	}
 
-	bodyBytes := h.encode()
+	headerBytes := h.encode()
 
-	_ = bodyBytes
+	reqBuf := bytes.NewBuffer(headerBytes)
 
+	conn, err := net.DialTimeout("tcp", peer+":8333", time.Second*3)
+	if err != nil {
+		log.Printf("Failed to send verack message. %s", err.Error())
+		return err
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(time.Second * 5))
+	_, err = conn.Write(reqBuf.Bytes())
+	if err != nil {
+		log.Print(err)
+	}
+
+	respBytes := readBytes(conn)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Peer responded to verack with: %x", respBytes)
+	conn.Close()
+
+	return nil
 }
 
 func discoverPeers() ([]Peer, error) {
